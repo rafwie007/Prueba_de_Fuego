@@ -1,8 +1,17 @@
 #pragma once
-#include "sensors.h"
-#include "logic.h"
-#include "secrets.h"
+#include "sensor_manager.h"
 
-void webServerInit(const char* ssid, const char* password);
-// webServerHandle() ya no es necesario — AsyncWebServer es no-bloqueante
-void webServerPushData(SensorData data, SystemState state);
+// ── Web Server ────────────────────────────────────────────────────────────────
+// AsyncWebServer that serves the dashboard UI and SSE data stream.
+//
+// CHANGED from original:
+//   • webServerInit() takes NO credentials — WiFiManager owns the connection.
+//   • Call webServerInit() once in setup(); it starts serving immediately.
+//     The server works over AP or STA depending on WiFiManager state.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Start the async web server (call once in setup).
+void webServerInit();
+
+// Push a new sensor snapshot to all connected SSE clients.
+void webServerPushData(const SensorData& data, const SystemState& state);

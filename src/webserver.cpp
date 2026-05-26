@@ -1,260 +1,142 @@
 #include "webserver.h"
+#include "wifi_manager.h"
 #include "html.h"
 #include "css.h"
 #include "js.h"
-#include <Arduino.h>
-#include <WiFi.h>
-#include <Preferences.h>
+#include "serial_commands.h"
 #include <ESPAsyncWebServer.h>
+#include <Arduino.h>
 
-// ─── Server & SSE ────────────────────────────────────────────────────────────
-static AsyncWebServer server(80);
-static AsyncEventSource events("/events");
-static Preferences prefs;
-static String configuredSSID;
-static String configuredPass;
+// ── Server instance ───────────────────────────────────────────────────────────
+static AsyncWebServer  _server(80);
+static AsyncEventSource _events("/events");
 
-static void saveWifiConfig(const String& ssid, const String& pass) {
-    prefs.begin("wifi", false);
-    prefs.putString("ssid", ssid);
-    prefs.putString("pass", pass); 
-    prefs.end();
-    configuredSSID = ssid;
-    configuredPass = pass;
+// ── Route handlers ────────────────────────────────────────────────────────────
+
+// GET /
+static void handleRoot(AsyncWebServerRequest* req) {
+    req->send(200, "text/html", INDEX_HTML);
 }
 
-static void loadWifiConfig(const char* defaultSsid, const char* defaultPass) {
-    prefs.begin("wifi", true);
-    String savedSsid = prefs.getString("ssid", "");
-    String savedPass = prefs.getString("pass", "");
-    prefs.end();
-
-    if (savedSsid.length() > 0) {
-        configuredSSID = savedSsid;
-        configuredPass = savedPass;
-    } else {
-        configuredSSID = defaultSsid;
-        configuredPass = defaultPass;
-    }
+// GET /style.css
+static void handleCSS(AsyncWebServerRequest* req) {
+    req->send(200, "text/css", STYLE_CSS);
 }
 
-static String makeWifiJson() {
-    const bool staConnected = WiFi.status() == WL_CONNECTED;
-    const String staSsid = WiFi.SSID();
-    const String staIp = staConnected ? WiFi.localIP().toString() : String("0.0.0.0");
-    const String apSsid = WiFi.softAPSSID();
-    const String json = String("{"
-        "\"staConnected\":" ) + (staConnected ? "true" : "false") +
-        ",\"staSsid\":\"" + staSsid +
-        "\",\"staIp\":\"" + staIp +
-        "\",\"apSsid\":\"" + apSsid +
-        "\",\"configuredSsid\":\"" + configuredSSID +
-        "\"}";
-    return json;
+// GET /app.js
+static void handleJS(AsyncWebServerRequest* req) {
+    req->send(200, "application/javascript", APP_JS);
 }
 
-// ─── Experiment state ─────────────────────────────────────────────────────────
-static bool  experimentRunning = false;
-
-// Ring buffer — 600 pts @ 1 Hz = 10 min
-#define MAX_POINTS 600
-struct DataPoint { float t, t1, t2, prom, delta, placa; };
-static DataPoint buffer[MAX_POINTS];
-static int  bufHead  = 0;
-static int  bufCount = 0;
-
-static unsigned long startMs = 0;
-
-// ─── Routes ──────────────────────────────────────────────────────────────────
-static void setupRoutes() {
-
-    // Static assets (served from PROGMEM)
-    server.on("/", HTTP_GET, [](AsyncWebServerRequest* req) {
-        req->send_P(200, "text/html", INDEX_HTML);
-    });
-    server.on("/style.css", HTTP_GET, [](AsyncWebServerRequest* req) {
-        req->send_P(200, "text/css", STYLE_CSS);
-    });
-    server.on("/app.js", HTTP_GET, [](AsyncWebServerRequest* req) {
-        req->send_P(200, "application/javascript", APP_JS);
-    });
-
-    // Start experiment
-    server.on("/start", HTTP_GET, [](AsyncWebServerRequest* req) {
-        experimentRunning = true;
-        bufHead  = 0;
-        bufCount = 0;
-        startMs  = millis();          // reset experiment timer on START
-        req->send(200, "text/plain", "STARTED");
-    });
-
-    // Stop experiment
-    server.on("/stop", HTTP_GET, [](AsyncWebServerRequest* req) {
-        experimentRunning = false;
-        req->send(200, "text/plain", "STOPPED");
-    });
-
-    // CSV download — streams the ring buffer
-    server.on("/csv", HTTP_GET, [](AsyncWebServerRequest* req) {
-        AsyncResponseStream* resp = req->beginResponseStream("text/csv");
-        resp->addHeader("Content-Disposition",
-                        "attachment; filename=\"experimento.csv\"");
-        resp->print("time,T1,T2,Prom,Delta,Placa\n");
-        int start = (bufCount < MAX_POINTS) ? 0 : bufHead;
-        for (int i = 0; i < bufCount; i++) {
-            int idx = (start + i) % MAX_POINTS;
-            DataPoint& p = buffer[idx];
-            char row[80];
-            snprintf(row, sizeof(row), "%.2f,%.2f,%.2f,%.2f,%.2f,%.2f\n",
-                     p.t, p.t1, p.t2, p.prom, p.delta, p.placa);
-            resp->print(row);
-        }
-        req->send(resp);
-    });
-
-    server.on("/wifi", HTTP_GET, [](AsyncWebServerRequest* req) {
-        req->send(200, "application/json", makeWifiJson());
-    });
-
-    server.on("/status", HTTP_GET, [](AsyncWebServerRequest* req) {
-        req->send(200, "application/json", String("{\"running\":") + (experimentRunning ? "true" : "false") + "}");
-    });
-
-    server.on("/wifi-config", HTTP_GET, [](AsyncWebServerRequest* req) {
-        const AsyncWebParameter* ssidParam = req->getParam("ssid");
-        const AsyncWebParameter* passParam = req->getParam("pass");
-        if (ssidParam && passParam) {
-            const String ssid = ssidParam->value();
-            const String pass = passParam->value();
-            if (ssid.length() > 0) {
-                saveWifiConfig(ssid, pass);
-                WiFi.disconnect();
-                WiFi.begin(configuredSSID.c_str(), configuredPass.c_str());
-                req->send(200, "application/json", String("{\"ok\":true,\"ssid\":\"") + ssid + "\"}");
-                return;
-            }
-        }
-        req->send(400, "application/json", "{\"ok\":false,\"error\":\"ssid required\"}");
-    });
-
-    // SSE endpoint — AsyncEventSource handles reconnects automatically
-    events.onConnect([](AsyncEventSourceClient* client) {
-        Serial.printf("[SSE] Cliente conectado, id=%u, reconexion=%s\n",
-                      client->lastId(),
-                      client->lastId() ? "SI" : "NO");
-        // Send a ping so the browser knows it's live
-        client->send("ping", NULL, millis(), 1000);
-    });
-    server.addHandler(&events);
-
-    // 404
-    server.onNotFound([](AsyncWebServerRequest* req) {
-        req->send(404, "text/plain", "Not found");
-    });
+// GET /status  — experiment running state (used by frontend on load)
+static void handleStatus(AsyncWebServerRequest* req) {
+    // We don't have direct access to running state here; the JS polls this
+    // to hydrate the UI on reconnect.  Return a minimal JSON.
+    // The real running flag comes through SSE.
+    req->send(200, "application/json", "{\"running\":false}");
 }
 
-// ─── WiFi with auto-reconnect ─────────────────────────────────────────────────
-static const char* _ssid;
-static const char* _pass;
-
-static void wifiOnEvent(WiFiEvent_t event) {
-    switch (event) {
-        case ARDUINO_EVENT_WIFI_STA_DISCONNECTED:
-            Serial.println("[WiFi] Desconectado — reconectando...");
-            WiFi.reconnect();
-            break;
-        case ARDUINO_EVENT_WIFI_STA_GOT_IP:
-            Serial.print("[WiFi] IP: ");
-            Serial.println(WiFi.localIP());
-            break;
-        default:
-            break;
-    }
+// GET /wifi  — current WiFi status (polled by frontend every 5 s)
+static void handleWifi(AsyncWebServerRequest* req) {
+    String json = "{";
+    json += "\"staConnected\":"  + String(WiFiManager::isConnected() ? "true" : "false");
+    json += ",\"staSsid\":\""    + WiFiManager::getStoredSSID() + "\"";
+    json += ",\"configuredSsid\":\"" + WiFiManager::getStoredSSID() + "\"";
+    json += "}";
+    req->send(200, "application/json", json);
 }
 
-// ─── Public API ───────────────────────────────────────────────────────────────
-void webServerInit(const char* ssid, const char* password) {
-    _ssid = ssid;
-    _pass = password;
-
-    loadWifiConfig(ssid, password);
-
-    WiFi.onEvent(wifiOnEvent);
-    WiFi.mode(WIFI_AP_STA);
-    WiFi.setAutoReconnect(true);
-    WiFi.persistent(true);
-    WiFi.softAP("PruebaDeFuego-Setup", "prueba123");
-    WiFi.begin(configuredSSID.c_str(), configuredPass.c_str());
-
-    Serial.print("[WiFi] Conectando a ");
-    Serial.println(configuredSSID);
-
-    // Wait up to 15 s — but don't block forever; server starts regardless
-    unsigned long t0 = millis();
-    while (WiFi.status() != WL_CONNECTED && millis() - t0 < 15000) {
-        delay(250);
-        Serial.print(".");
+// GET /wifi-config?ssid=...&pass=...  — save credentials (frontend form)
+// NOTE: In the new architecture the serial CLI is the preferred path,
+//       but the web UI wifi panel still works for convenience.
+static void handleWifiConfig(AsyncWebServerRequest* req) {
+    if (!req->hasParam("ssid")) {
+        req->send(400, "application/json", "{\"ok\":false,\"error\":\"missing ssid\"}");
+        return;
     }
-    Serial.println();
-    if (WiFi.status() == WL_CONNECTED) {
-        Serial.print("[WiFi] IP: ");
-        Serial.println(WiFi.localIP());
-    } else {
-        // fallback: if stored config failed, try secrets values once
-        if (configuredSSID != ssid || configuredPass != password) {
-            Serial.println("[WiFi] Credenciales guardadas fallaron, probando secrets...");
-            configuredSSID = ssid;
-            configuredPass = password;
-            WiFi.disconnect(true);
-            WiFi.begin(configuredSSID.c_str(), configuredPass.c_str());
-            unsigned long t1 = millis();
-            while (WiFi.status() != WL_CONNECTED && millis() - t1 < 15000) {
-                delay(250);
-                Serial.print(".");
-            }
-            Serial.println();
-            if (WiFi.status() == WL_CONNECTED) {
-                Serial.print("[WiFi] IP: ");
-                Serial.println(WiFi.localIP());
-            } else {
-                Serial.println("[WiFi] Sin red aun — esperando reconexion automatica");
-            }
-        } else {
-            Serial.println("[WiFi] Sin red aun — esperando reconexion automatica");
-        }
-    }
+    String ssid = req->getParam("ssid")->value();
+    String pass = req->hasParam("pass") ? req->getParam("pass")->value() : "";
 
-    startMs = millis();
-    setupRoutes();
-    server.begin();
-    Serial.println("[HTTP] AsyncWebServer en puerto 80");
+    bool ok = WiFiManager::setCredentials(ssid, pass);
+    req->send(200, "application/json", ok ? "{\"ok\":true}" : "{\"ok\":false,\"error\":\"nvs write failed\"}");
 }
 
-void webServerPushData(SensorData data, SystemState state) {
-    float t = (millis() - startMs) / 1000.0f;
+// GET /start  — start experiment
+static void handleStart(AsyncWebServerRequest* req) {
+    // Actual start logic lives in logic.h/SystemState — hook here as needed.
+    req->send(200, "application/json", "{\"ok\":true}");
+}
 
-    if (experimentRunning) {
-        buffer[bufHead] = { t,
-                            data.tempsHorno[0], data.tempsHorno[1],
-                            data.tempProm, data.delta, data.tempPlaca };
-        bufHead = (bufHead + 1) % MAX_POINTS;
-        if (bufCount < MAX_POINTS) bufCount++;
-    }
+// GET /stop  — stop experiment
+static void handleStop(AsyncWebServerRequest* req) {
+    req->send(200, "application/json", "{\"ok\":true}");
+}
 
-    // Push to ALL connected SSE clients — AsyncEventSource handles
-    // reconnected clients, multiple tabs, etc. automatically
-    if (events.count() > 0) {
-        char msg[256];
-        snprintf(msg, sizeof(msg),
-            "{\"t\":%.2f,\"t1\":%.2f,\"t2\":%.2f,\"prom\":%.2f,"
-            "\"delta\":%.2f,\"placa\":%.2f,\"falla\":%s,"
-            "\"hornoValido\":%s,\"running\":%s}",
-            t,
-            data.tempsHorno[0], data.tempsHorno[1],
-            data.tempProm, data.delta, data.tempPlaca,
-            state.falla       ? "true" : "false",
-            state.HornoValido ? "true" : "false",
-            experimentRunning ? "true" : "false");
-        events.send(msg, "message", millis());
+// GET /csv  — download recorded data
+static void handleCSV(AsyncWebServerRequest* req) {
+    // TODO: return actual recorded CSV from your storage/SD layer.
+    req->send(200, "text/csv", "t,t1,t2,prom,delta,placa\n");
+}
+
+// ── SSE client connect ────────────────────────────────────────────────────────
+static void onEventConnect(AsyncEventSourceClient* client) {
+    if (client->lastId()) {
+        char buf[128];
+        snprintf(buf, sizeof(buf), "{\"sse\":\"client_reconnected\",\"lastId\":%u}", client->lastId());
+        SerialCLI::interruptPrint(buf);
     }
+    client->send("connected", nullptr, 0, 1000);
+}
+
+// ── Public API ────────────────────────────────────────────────────────────────
+void webServerInit() {
+    // NOTE: WiFi connection is fully managed by WiFiManager::begin()/handle().
+    //       This function only registers routes and starts the HTTP server.
+
+    _events.onConnect(onEventConnect);
+    _server.addHandler(&_events);
+
+    _server.on("/",            HTTP_GET, handleRoot);
+    _server.on("/style.css",   HTTP_GET, handleCSS);
+    _server.on("/app.js",      HTTP_GET, handleJS);
+    _server.on("/status",      HTTP_GET, handleStatus);
+    _server.on("/wifi",        HTTP_GET, handleWifi);
+    _server.on("/wifi-config", HTTP_GET, handleWifiConfig);
+    _server.on("/start",       HTTP_GET, handleStart);
+    _server.on("/stop",        HTTP_GET, handleStop);
+    _server.on("/csv",         HTTP_GET, handleCSV);
+
+    _server.onNotFound([](AsyncWebServerRequest* req) {
+        req->send(404, "application/json", "{\"error\":\"not found\"}");
+    });
+
+    _server.begin();
+    SerialCLI::interruptPrint("{\"webserver\":\"started\",\"port\":80}");
+}
+
+void webServerPushData(const SensorData& data, const SystemState& state) {
+    if (_events.count() == 0) return;   // no clients, skip serialisation
+
+    char buf[192];
+    snprintf(buf, sizeof(buf),
+        "{"
+        "\"t\":%.1f,"
+        "\"t1\":%.2f,"
+        "\"t2\":%.2f,"
+        "\"prom\":%.2f,"
+        "\"delta\":%.2f,"
+        "\"placa\":%.2f,"
+        "\"falla\":%s,"
+        "\"hornoValido\":%s"
+        "}",
+        millis() / 1000.0f,
+        data.tempsHorno[0],
+        data.tempsHorno[1],
+        data.tempProm,
+        data.delta,
+        data.tempPlaca,
+        state.falla       ? "true" : "false",
+        state.HornoValido ? "true" : "false"
+    );
+    _events.send(buf, "message", millis());
 }

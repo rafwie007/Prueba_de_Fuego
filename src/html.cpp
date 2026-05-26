@@ -101,25 +101,6 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
       </div>
     </div>
 
-    <!-- WiFi panel -->
-    <div class="wifi-panel">
-      <div class="wifi-title">&#9474; Conexion WiFi</div>
-      <div class="wifi-row">
-        <span>Estado</span>
-        <span id="wifiStaStatus" style="color:#f44">Desconectado</span>
-      </div>
-      <div class="wifi-row">
-        <span>Red</span>
-        <span id="wifiStaSsid" style="color:#888">--</span>
-      </div>
-      <div class="wifi-config">
-        <input type="text"     id="ssidInput" placeholder="SSID">
-        <input type="password" id="passInput" placeholder="Password">
-        <button id="btnSaveWifi" onclick="saveWifi()">Guardar configuracion</button>
-      </div>
-      <div id="wifiMsg" class="wifi-msg"></div>
-    </div>
-
   </aside>
 
   <!-- ═══════════════ MAIN AREA ══════════════ -->

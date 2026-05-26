@@ -11,12 +11,6 @@ let threshTimes = { t30: null, t180: null, t200: null };
 const cv       = document.getElementById('cv');
 const ctx      = cv.getContext('2d');
 const connBadge    = document.getElementById('connBadge');
-const wifiStaStatus = document.getElementById('wifiStaStatus');
-const wifiStaSsid   = document.getElementById('wifiStaSsid');
-const ssidInput  = document.getElementById('ssidInput');
-const passInput  = document.getElementById('passInput');
-const btnSaveWifi = document.getElementById('btnSaveWifi');
-const wifiMsg    = document.getElementById('wifiMsg');
 const recStatus  = document.getElementById('recStatus');
 const recLabel   = document.getElementById('recLabel');
 const elapsedTime = document.getElementById('elapsedTime');
@@ -42,13 +36,6 @@ window.addEventListener('resize', () => { resize(); draw(); });
 resize();
 
 // ── WiFi UI ────────────────────────────────────
-function updateWifiUI(info) {
-  wifiStaStatus.textContent  = info.staConnected ? 'Conectado' : 'Desconectado';
-  wifiStaStatus.style.color  = info.staConnected ? '#4f4' : '#f44';
-  wifiStaSsid.textContent    = info.staConnected ? (info.staSsid || '---') : '---';
-  if (info.configuredSsid) ssidInput.value = info.configuredSsid;
-}
-
 function loadStatus() {
   fetch('/status').then(r => r.json()).then(info => {
     const running = !!info.running;
@@ -57,49 +44,7 @@ function loadStatus() {
   }).catch(() => { setButtons(false); setRunningState(false); });
 }
 
-function loadWifiStatus() {
-  fetch('/wifi').then(r => r.json()).then(info => {
-    updateWifiUI(info);
-    setConn(info.staConnected);
-  }).catch(() => {
-    wifiStaStatus.textContent = 'No disponible';
-    wifiStaStatus.style.color = '#f44';
-    setConn(false);
-  });
-}
-
-function saveWifi() {
-  const ssid = ssidInput.value.trim();
-  const pass = passInput.value;
-  if (!ssid) {
-    wifiMsg.textContent = 'SSID requerido';
-    wifiMsg.style.color = '#f44';
-    return;
-  }
-  btnSaveWifi.disabled = true;
-  wifiMsg.textContent = 'Guardando...';
-  wifiMsg.style.color = '#ccc';
-  fetch(`/wifi-config?ssid=${encodeURIComponent(ssid)}&pass=${encodeURIComponent(pass)}`)
-    .then(r => r.json())
-    .then(result => {
-      if (result.ok) {
-        wifiMsg.textContent = 'Guardado. Reintentando conexion...';
-        wifiMsg.style.color = '#4f4';
-        setTimeout(loadWifiStatus, 3000);
-      } else {
-        wifiMsg.textContent = 'Error: ' + (result.error || 'desconocido');
-        wifiMsg.style.color = '#f44';
-      }
-    }).catch(() => {
-      wifiMsg.textContent = 'No se pudo guardar la configuracion';
-      wifiMsg.style.color = '#f44';
-    }).finally(() => btnSaveWifi.disabled = false);
-}
-window.saveWifi = saveWifi;
-
 loadStatus();
-loadWifiStatus();
-setInterval(loadWifiStatus, 5000);
 
 // ── Threshold UI update ───────────────────────
 function updateThreshUI() {
@@ -329,32 +274,54 @@ window.stopExp  = stopExp;
 
 // ── SSE data push ──────────────────────────────
 function push(d) {
-  ts.push(d.t); t1s.push(d.t1); t2s.push(d.t2);
-  pr.push(d.prom); pl.push(d.placa);
+  // Map backend field names to chart arrays
+  // Backend sends: t, t1, t2, prom, delta, placa, falla, hornoValido
+  ts.push(d.t);
+  t1s.push(d.t1);
+  t2s.push(d.t2);
+  pr.push(d.prom);
+  pl.push(d.placa);
   if (ts.length > MAX) { ts.shift(); t1s.shift(); t2s.shift(); pr.shift(); pl.shift(); }
 
-  // Detect threshold crossings (only while running, first crossing)
-  if (d.running) {
+  // "running" = experiment started and horno is valid and no fault
+  const running = !d.falla && d.hornoValido;
+
+  // Detect threshold crossings on cold face plate
+  if (running) {
     if (threshTimes.t30  === null && d.placa >= 30)  threshTimes.t30  = d.t;
     if (threshTimes.t180 === null && d.placa >= 180) threshTimes.t180 = d.t;
     if (threshTimes.t200 === null && d.placa >= 200) threshTimes.t200 = d.t;
     updateThreshUI();
   }
 
-  // Update cards
+  // Update metric cards
   document.getElementById('t1').textContent    = d.t1.toFixed(1);
   document.getElementById('t2').textContent    = d.t2.toFixed(1);
   document.getElementById('prom').textContent  = d.prom.toFixed(1);
   document.getElementById('delta').textContent = d.delta.toFixed(1);
   document.getElementById('placa').textContent = d.placa.toFixed(1);
 
-  if (d.running) {
+  // Estado card
+  const estadoEl = document.getElementById('estado');
+  if (d.falla) {
+    estadoEl.textContent = 'FALLA';
+    estadoEl.style.color = '#f44';
+  } else if (d.hornoValido) {
+    estadoEl.textContent = 'VALIDO';
+    estadoEl.style.color = '#4f4';
+  } else {
+    estadoEl.textContent = 'ESPERA';
+    estadoEl.style.color = '#fa4';
+  }
+
+  // Recording status bar
+  if (running) {
     recLabel.textContent = 'EN EJECUCION';
     recStatus.classList.add('rec-recording');
     recStatus.classList.remove('rec-stopped');
     elapsedTime.textContent = formatTime(d.t);
   } else {
-    recLabel.textContent = 'DETENIDO';
+    recLabel.textContent = d.falla ? 'FALLA' : 'DETENIDO';
     recStatus.classList.add('rec-stopped');
     recStatus.classList.remove('rec-recording');
     elapsedTime.textContent = '';
